@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: highload-zhizha
+data:
+  loki-config.yaml: |
+    auth_enabled: false
+    server: { http_listen_port: 3100 }
+    common:
+      path_prefix: /loki
+      storage:
+        filesystem: { chunks_directory: /loki/chunks, rules_directory: /loki/rules }
+      replication_factor: 1
+      ring: { kvstore: { store: inmemory } }
+    schema_config:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index: { prefix: index_, period: 24h }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: highload-zhizha
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: loki }
+  template:
+    metadata:
+      labels: { app: loki }
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.7.0
+          args: ["-config.file=/etc/loki/loki-config.yaml"]
+          ports: [{ containerPort: 3100 }]
+          readinessProbe: { httpGet: { path: /ready, port: 3100 }, initialDelaySeconds: 5, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/loki }
+            - { name: data, mountPath: /loki }
+      volumes:
+        - name: config
+          configMap: { name: loki-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: loki, namespace: highload-zhizha }
+spec:
+  selector: { app: loki }
+  ports: [{ port: 3100, targetPort: 3100 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: grafana-datasource, namespace: highload-zhizha }
+data:
+  loki.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki:3100
+        isDefault: true
+        editable: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: grafana, namespace: highload-zhizha }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: grafana }
+  template:
+    metadata:
+      labels: { app: grafana }
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:12.1.1
+          ports: [{ containerPort: 3000 }]
+          env:
+            - { name: GF_SECURITY_ADMIN_USER, value: admin }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, value: admin }
+          readinessProbe: { httpGet: { path: /api/health, port: 3000 }, initialDelaySeconds: 10, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: datasource, mountPath: /etc/grafana/provisioning/datasources }
+      volumes:
+        - name: datasource
+          configMap: { name: grafana-datasource }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: grafana, namespace: highload-zhizha }
+spec:
+  selector: { app: grafana }
+  ports: [{ port: 3000, targetPort: 3000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: grafana, namespace: highload-zhizha }
+spec:
+  rules:
+    - host: grafana.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: grafana, port: { number: 3000 } }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: alloy, namespace: highload-zhizha }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: highload-zhizha-alloy }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: highload-zhizha-alloy }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: highload-zhizha-alloy }
+subjects:
+  - { kind: ServiceAccount, name: alloy, namespace: highload-zhizha }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: alloy-config, namespace: highload-zhizha }
+data:
+  config.alloy: |
+    logging {
+      level  = "info"
+      format = "json"
+    }
+
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+    }
+
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pod_logs.output
+      forward_to = [loki.write.default.receiver]
+    }
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: alloy, namespace: highload-zhizha }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: alloy }
+  template:
+    metadata:
+      labels: { app: alloy }
+    spec:
+      serviceAccountName: alloy
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.11.3
+          args: ["run", "/etc/alloy/config.alloy", "--server.http.listen-addr=0.0.0.0:12345"]
+          ports: [{ containerPort: 12345 }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 300m, memory: 256Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alloy }
+      volumes:
+        - name: config
+          configMap: { name: alloy-config }

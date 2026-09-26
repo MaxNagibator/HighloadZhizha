@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: highload-zhizha
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: highload-zhizha
+type: Opaque
+stringData:
+  POSTGRES_USER: bank
+  POSTGRES_PASSWORD: local-dev-password
+  POSTGRES_DB: highload
+  DATABASE_URL_GO: postgres://bank:local-dev-password@postgres:5432/highload?sslmode=disable
+  DATABASE_URL_DOTNET: Host=postgres;Port=5432;Database=highload;Username=bank;Password=local-dev-password
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: highload-zhizha
+data:
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC: bank.account.events
+
