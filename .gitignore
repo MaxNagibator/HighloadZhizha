@@ -1,0 +1,17 @@
+# IDE and local tooling
+.vs/
+.idea/
+.vscode/
+
+# Build artifacts
+**/bin/
+**/obj/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
