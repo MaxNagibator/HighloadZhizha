@@ -7,6 +7,7 @@
 - GreenBankService и PaymentService;
 - MemoryZhorka с демонстрационным лимитом памяти 2 ГиБ;
 - NotificationService, эмулирующий SMS структурированными логами в Loki;
+- HighloadZhizha.ManagementService с веб-панелью управления нагрузкой;
 - PostgreSQL и persistent volume;
 - Apache Kafka в KRaft-режиме и Job создания топика;
 - Grafana, Loki и Alloy.
@@ -26,6 +27,8 @@ kubectl logs -n highload-zhizha deployment/payment-service
 
 API: `http://localhost:9080`  
 Grafana: `http://grafana.localhost:9080`.
+Нагрузочная панель: `http://load.localhost:9080`.
+Готовый дашборд: `http://grafana.localhost:9080/d/highload-zhizha/highload-zhizha`.
 MemoryZhorka: `POST http://memory.localhost:9080/eat-memory`.
 
 SMS-логи в Grafana Explore:

@@ -1,6 +1,6 @@
 # HighloadZhizha workspace
 
-Этот каталог объединяет три независимых репозитория, которыми владеют разные команды:
+Этот монорепозиторий объединяет сервисы и инфраструктуру HighloadZhizha:
 
 | Репозиторий | Команда | Ответственность |
 |---|---|---|
@@ -8,9 +8,8 @@
 | `PaymentService` | .NET | Kafka consumer и идемпотентная обработка банковских событий |
 | `MemoryZhorka` | Go | Демонстрация Kubernetes memory limit и восстановления после OOMKilled |
 | `NotificationService` | .NET | Kafka consumer и эмуляция SMS через структурированные Loki-логи |
+| `HighloadZhizha.ManagementService` | .NET | Веб-панель управления синтетической нагрузкой и её статистика |
 | `HighloadZhizha.Platform` | DevOps/SRE | Kubernetes, PostgreSQL, Kafka, Grafana, Loki, Alloy и локальный deploy |
-
-Репозитории не используют общий исходный код и могут версионироваться и выпускаться независимо.
 
 ## Локальная сборка и развёртывание
 
@@ -27,9 +26,13 @@ cd ..\MemoryZhorka
 cd ..\NotificationService
 .\scripts\build-local.ps1
 
+cd ..\HighloadZhizha.ManagementService
+.\scripts\build-local.ps1
+
 cd ..\HighloadZhizha.Platform
 .\scripts\deploy.ps1
 ```
 
 API: `http://localhost:9080`  
+Управление нагрузкой: `http://load.localhost:9080`  
 Grafana: `http://grafana.localhost:9080` (`admin` / `admin` для локального стенда).

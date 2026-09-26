@@ -166,3 +166,61 @@ spec:
           resources:
             requests: { cpu: 25m, memory: 64Mi }
             limits: { cpu: 300m, memory: 256Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: management-service
+  namespace: highload-zhizha
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: management-service }
+  template:
+    metadata:
+      labels: { app: management-service }
+    spec:
+      containers:
+        - name: management-service
+          image: highload/management-service:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 8080 }
+          env:
+            - { name: BANK_URL, value: "http://green-bank-service" }
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: "1", memory: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: management-service
+  namespace: highload-zhizha
+spec:
+  selector: { app: management-service }
+  ports:
+    - { port: 80, targetPort: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: management-service
+  namespace: highload-zhizha
+spec:
+  rules:
+    - host: load.localhost
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: management-service, port: { number: 80 } }
