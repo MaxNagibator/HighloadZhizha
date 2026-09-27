@@ -60,6 +60,85 @@ spec:
   ports: [{ port: 3100, targetPort: 3100 }]
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata: { name: prometheus, namespace: highload-zhizha }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: highload-zhizha-prometheus }
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: highload-zhizha-prometheus }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: highload-zhizha-prometheus }
+subjects:
+  - { kind: ServiceAccount, name: prometheus, namespace: highload-zhizha }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: prometheus-config, namespace: highload-zhizha }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    scrape_configs:
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: highload-zhizha }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.5.0
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus", "--storage.tsdb.retention.time=24h"]
+          ports: [{ containerPort: 9090 }]
+          readinessProbe: { httpGet: { path: /-/ready, port: 9090 }, initialDelaySeconds: 5, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: highload-zhizha }
+spec:
+  selector: { app: prometheus }
+  ports: [{ port: 9090, targetPort: 9090 }]
+---
+apiVersion: v1
 kind: ConfigMap
 metadata: { name: grafana-datasource, namespace: highload-zhizha }
 data:
@@ -72,6 +151,15 @@ data:
         access: proxy
         url: http://loki:3100
         isDefault: true
+        editable: false
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
         editable: false
 ---
 apiVersion: v1
@@ -110,6 +198,24 @@ data:
         {"id":4,"type":"stat","title":"События PaymentService","gridPos":{"x":18,"y":0,"w":6,"h":5},"datasource":{"type":"loki","uid":"Loki"},"targets":[{"refId":"A","expr":"sum(count_over_time({namespace=\"highload-zhizha\", app=\"payment-service\"} [$__range])) or vector(0)","queryType":"instant"}]},
         {"id":5,"type":"timeseries","title":"Запросы и СМС по времени","gridPos":{"x":0,"y":5,"w":24,"h":9},"datasource":{"type":"loki","uid":"Loki"},"targets":[{"refId":"A","expr":"sum(count_over_time({namespace=\"highload-zhizha\", app=\"management-service\"} |= \"LOAD_REQUEST\" [$__interval]))","legendFormat":"Запросы"},{"refId":"B","expr":"sum(count_over_time({namespace=\"highload-zhizha\", app=\"notification-service\"} |= \"SMS_SENT\" [$__interval]))","legendFormat":"SMS_SENT"}]},
         {"id":6,"type":"logs","title":"Последние SMS_SENT","gridPos":{"x":0,"y":14,"w":24,"h":10},"datasource":{"type":"loki","uid":"Loki"},"targets":[{"refId":"A","expr":"{namespace=\"highload-zhizha\", app=\"notification-service\"} |= \"SMS_SENT\""}],"options":{"showTime":true,"wrapLogMessage":true,"sortOrder":"Descending"}}
+      ]
+    }
+  highload-resources.json: |
+    {
+      "uid": "highload-resources",
+      "title": "HighloadZhizha — CPU и память",
+      "tags": ["highload", "kubernetes", "resources"],
+      "timezone": "browser",
+      "schemaVersion": 41,
+      "refresh": "5s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {"id":1,"type":"stat","title":"CPU всех сервисов","gridPos":{"x":0,"y":0,"w":8,"h":5},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"sum(rate(container_cpu_usage_seconds_total{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"}[1m]))","instant":true}],"fieldConfig":{"defaults":{"unit":"cores","decimals":3}}},
+        {"id":2,"type":"stat","title":"Память всех сервисов","gridPos":{"x":8,"y":0,"w":8,"h":5},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"sum(container_memory_working_set_bytes{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"})","instant":true}],"fieldConfig":{"defaults":{"unit":"bytes"}}},
+        {"id":3,"type":"stat","title":"Контейнеров наблюдается","gridPos":{"x":16,"y":0,"w":8,"h":5},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"count(container_memory_working_set_bytes{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"})","instant":true}]},
+        {"id":4,"type":"timeseries","title":"CPU по pod","gridPos":{"x":0,"y":5,"w":24,"h":9},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"}[1m]))","legendFormat":"{{pod}}"}],"fieldConfig":{"defaults":{"unit":"cores","decimals":3}}},
+        {"id":5,"type":"timeseries","title":"Рабочая память по pod","gridPos":{"x":0,"y":14,"w":24,"h":9},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"sum by (pod) (container_memory_working_set_bytes{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"})","legendFormat":"{{pod}}"}],"fieldConfig":{"defaults":{"unit":"bytes"}}},
+        {"id":6,"type":"timeseries","title":"Использование memory limit по pod","gridPos":{"x":0,"y":23,"w":24,"h":9},"datasource":{"type":"prometheus","uid":"Prometheus"},"targets":[{"refId":"A","expr":"100 * sum by (pod) (container_memory_working_set_bytes{namespace=\"highload-zhizha\", container!=\"\", image!=\"\"}) / sum by (pod) (container_spec_memory_limit_bytes{namespace=\"highload-zhizha\", container!=\"\", image!=\"\", container_spec_memory_limit_bytes>0})","legendFormat":"{{pod}}"}],"fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100}}}
       ]
     }
 ---

@@ -10,7 +10,7 @@
 - HighloadZhizha.ManagementService с веб-панелью управления нагрузкой;
 - PostgreSQL и persistent volume;
 - Apache Kafka в KRaft-режиме и Job создания топика;
-- Grafana, Loki и Alloy.
+- Grafana, Loki, Alloy и Prometheus со сбором CPU/памяти контейнеров через cAdvisor.
 
 Сервисные образы выпускаются отдельными репозиториями. Для локального стенда сначала выполните `scripts/build-local.ps1` в каждом сервисном репозитории, затем:
 
@@ -28,7 +28,8 @@ kubectl logs -n highload-zhizha deployment/payment-service
 API: `http://localhost:9080`  
 Grafana: `http://grafana.localhost:9080`.
 Нагрузочная панель: `http://load.localhost:9080`.
-Готовый дашборд: `http://grafana.localhost:9080/d/highload-zhizha/highload-zhizha`.
+Дашборд нагрузки и событий: `http://grafana.localhost:9080/d/highload-zhizha/highloadzhizha-e28094-nagruzka-i-sobytija`.
+Дашборд CPU и памяти: `http://grafana.localhost:9080/d/highload-resources/highloadzhizha-e28094-cpu-i-pamjat`.
 MemoryZhorka: `POST http://memory.localhost:9080/eat-memory`.
 
 SMS-логи в Grafana Explore:

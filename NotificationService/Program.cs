@@ -14,7 +14,8 @@ sealed record BankEvent(
     Guid CorrelationId,
     Guid AccountId,
     long Amount,
-    long Balance);
+    long Balance,
+    string? TraceId = null);
 
 sealed class BankEventNotificationConsumer(
     ILogger<BankEventNotificationConsumer> logger,
@@ -54,6 +55,7 @@ sealed class BankEventNotificationConsumer(
                     ["eventId"] = bankEvent.EventId,
                     ["eventType"] = bankEvent.EventType,
                     ["correlationId"] = bankEvent.CorrelationId,
+                    ["traceId"] = bankEvent.TraceId ?? string.Empty,
                     ["accountId"] = bankEvent.AccountId,
                     ["channel"] = "SMS",
                     ["provider"] = "loki-log-simulator",
@@ -119,4 +121,3 @@ sealed class JsonBankEventDeserializer : IDeserializer<BankEvent>
             : System.Text.Json.JsonSerializer.Deserialize<BankEvent>(data, Options)
               ?? throw new System.Text.Json.JsonException("Kafka message does not contain a bank event");
 }
-

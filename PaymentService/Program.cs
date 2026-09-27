@@ -15,7 +15,8 @@ sealed record BankEvent(
     Guid CorrelationId,
     Guid AccountId,
     long Amount,
-    long Balance);
+    long Balance,
+    string? TraceId = null);
 
 sealed class BankEventsConsumer(ILogger<BankEventsConsumer> logger, IConfiguration configuration) : BackgroundService
 {
@@ -50,9 +51,9 @@ sealed class BankEventsConsumer(ILogger<BankEventsConsumer> logger, IConfigurati
                 var inserted = await SaveEventAsync(bankEvent, result.TopicPartitionOffset.ToString(), stoppingToken);
                 consumer.Commit(result);
                 logger.LogInformation(
-                    "Bank event {Result}: {EventType}, eventId={EventId}, correlationId={CorrelationId}, accountId={AccountId}, amount={Amount}, balance={Balance}",
+                    "Bank event {Result}: {EventType}, eventId={EventId}, correlationId={CorrelationId}, traceId={TraceId}, accountId={AccountId}, amount={Amount}, balance={Balance}",
                     inserted ? "processed" : "already processed", bankEvent.EventType, bankEvent.EventId,
-                    bankEvent.CorrelationId, bankEvent.AccountId, bankEvent.Amount, bankEvent.Balance);
+                    bankEvent.CorrelationId, bankEvent.TraceId, bankEvent.AccountId, bankEvent.Amount, bankEvent.Balance);
             }
             catch (ConsumeException ex)
             {
@@ -111,4 +112,3 @@ sealed class BankEventsConsumer(ILogger<BankEventsConsumer> logger, IConfigurati
         return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 }
-
