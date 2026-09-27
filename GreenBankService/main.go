@@ -58,6 +58,16 @@ type withdrawalRequest struct {
 	CorrelationID string `json:"correlationId"`
 }
 
+type withdrawalResult int
+
+const (
+	withdrawalApplied withdrawalResult = iota
+	withdrawalAccountNotFound
+	withdrawalInsufficientFunds
+	withdrawalConcurrentConflict
+	maxWithdrawalAttempts = 5
+)
+
 type categoryPolicy struct {
 	Code                string `json:"code"`
 	CashbackBasisPoints int64  `json:"cashbackBasisPoints"`
@@ -147,8 +157,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     id uuid PRIMARY KEY,
     owner_name text NOT NULL,
     balance bigint NOT NULL DEFAULT 0 CHECK (balance >= 0),
+	version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS version bigint NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS transactions (
     id uuid PRIMARY KEY,
     account_id uuid NOT NULL REFERENCES accounts(id),
@@ -316,7 +328,7 @@ func (a *app) topUp(w http.ResponseWriter, r *http.Request) {
 	cashbackCorrelationID := uuid.NewSHA1(corrID, []byte("cashback"))
 
 	var balance int64
-	err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1 WHERE id=$2 RETURNING balance", req.Amount, accountID).Scan(&balance)
+	err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1, version=version+1 WHERE id=$2 RETURNING balance", req.Amount, accountID).Scan(&balance)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "account not found")
 		return
@@ -333,7 +345,7 @@ VALUES($1, $2, 'TOP_UP', $3, $4, $5, $6)`, topUpTransactionID, accountID, req.Am
 	}
 	var cashbackEvent bankEvent
 	if err == nil && cashback > 0 {
-		err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1 WHERE id=$2 RETURNING balance", cashback, accountID).Scan(&balance)
+		err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1, version=version+1 WHERE id=$2 RETURNING balance", cashback, accountID).Scan(&balance)
 	}
 	if err == nil && cashback > 0 {
 		_, err = tx.Exec(r.Context(), `INSERT INTO transactions(id, account_id, transaction_type, amount, balance_after, correlation_id, category, source_transaction_id)
@@ -400,30 +412,26 @@ func (a *app) withdraw(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	var balance int64
-	err = tx.QueryRow(r.Context(), `UPDATE accounts
-SET balance=balance-$1
-WHERE id=$2 AND balance >= $1
-RETURNING balance`, req.Amount, accountID).Scan(&balance)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var available int64
-		lookupErr := tx.QueryRow(r.Context(), "SELECT balance FROM accounts WHERE id=$1", accountID).Scan(&available)
-		if errors.Is(lookupErr, pgx.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "account not found")
-			return
-		}
-		if lookupErr != nil {
-			writeError(w, http.StatusInternalServerError, "could not check account balance")
-			return
-		}
-		writeJSON(w, http.StatusConflict, map[string]any{
-			"error": "insufficient funds", "accountId": accountID,
-			"requestedAmount": req.Amount, "availableBalance": available,
-		})
-		return
-	}
+	balance, result, err := withdrawOptimistically(r.Context(), tx, accountID, req.Amount)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not withdraw funds")
+		return
+	}
+	switch result {
+	case withdrawalAccountNotFound:
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	case withdrawalInsufficientFunds:
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "insufficient funds", "accountId": accountID,
+			"requestedAmount": req.Amount, "availableBalance": balance,
+		})
+		return
+	case withdrawalConcurrentConflict:
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":     "account balance changed concurrently; retry the request",
+			"accountId": accountID, "correlationId": corrID,
+		})
 		return
 	}
 
@@ -473,6 +481,34 @@ FROM transactions WHERE correlation_id=$1`, corrID).Scan(&existingAccountID, &tr
 		"correlationId": corrID, "duplicate": true,
 	})
 	return true
+}
+
+func withdrawOptimistically(ctx context.Context, tx pgx.Tx, accountID uuid.UUID, amount int64) (int64, withdrawalResult, error) {
+	for attempt := 0; attempt < maxWithdrawalAttempts; attempt++ {
+		var balance, version int64
+		err := tx.QueryRow(ctx, "SELECT balance, version FROM accounts WHERE id=$1", accountID).Scan(&balance, &version)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, withdrawalAccountNotFound, nil
+		}
+		if err != nil {
+			return 0, withdrawalConcurrentConflict, err
+		}
+		if balance < amount {
+			return balance, withdrawalInsufficientFunds, nil
+		}
+
+		newBalance := balance - amount
+		command, err := tx.Exec(ctx, `UPDATE accounts
+SET balance=$1, version=version+1
+WHERE id=$2 AND version=$3`, newBalance, accountID, version)
+		if err != nil {
+			return 0, withdrawalConcurrentConflict, err
+		}
+		if command.RowsAffected() == 1 {
+			return newBalance, withdrawalApplied, nil
+		}
+	}
+	return 0, withdrawalConcurrentConflict, nil
 }
 
 func seedCategoryCache(ctx context.Context, client *redis.Client) error {
