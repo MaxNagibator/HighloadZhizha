@@ -53,6 +53,11 @@ type topUpRequest struct {
 	Category      string `json:"category"`
 }
 
+type withdrawalRequest struct {
+	Amount        int64  `json:"amount"`
+	CorrelationID string `json:"correlationId"`
+}
+
 type categoryPolicy struct {
 	Code                string `json:"code"`
 	CashbackBasisPoints int64  `json:"cashbackBasisPoints"`
@@ -110,6 +115,7 @@ func main() {
 	mux.HandleFunc("GET /health", a.health)
 	mux.HandleFunc("POST /accounts", a.createAccount)
 	mux.HandleFunc("POST /accounts/{accountId}/top-ups", a.topUp)
+	mux.HandleFunc("POST /accounts/{accountId}/withdrawals", a.withdraw)
 
 	server := &http.Server{Addr: ":8080", Handler: requestLog(logger, mux), ReadHeaderTimeout: 5 * time.Second}
 	profileServer := &http.Server{Addr: ":6060", Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
@@ -153,7 +159,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_transaction_type_check;
-ALTER TABLE transactions ADD CONSTRAINT transactions_transaction_type_check CHECK (transaction_type IN ('TOP_UP', 'CASHBACK'));
+ALTER TABLE transactions ADD CONSTRAINT transactions_transaction_type_check CHECK (transaction_type IN ('TOP_UP', 'CASHBACK', 'WITHDRAWAL'));
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category text;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_transaction_id uuid REFERENCES transactions(id);
 CREATE INDEX IF NOT EXISTS ix_transactions_account_created ON transactions(account_id, created_at DESC);
@@ -363,6 +369,110 @@ VALUES($1, $2, 'CASHBACK', $3, $4, $5, $6, $7)`, uuid.New(), accountID, cashback
 		response["cashbackEventId"] = cashbackEvent.EventID
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (a *app) withdraw(w http.ResponseWriter, r *http.Request) {
+	accountID, err := uuid.Parse(r.PathValue("accountId"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "accountId must be a UUID")
+		return
+	}
+
+	var req withdrawalRequest
+	if err = json.NewDecoder(r.Body).Decode(&req); err != nil || req.Amount <= 0 {
+		writeError(w, http.StatusBadRequest, "amount must be a positive integer in minor currency units")
+		return
+	}
+	corrID, err := uuid.Parse(req.CorrelationID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "correlationId is required and must be a UUID")
+		return
+	}
+
+	if handled := a.writeExistingWithdrawal(w, r, accountID, corrID); handled {
+		return
+	}
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	var balance int64
+	err = tx.QueryRow(r.Context(), `UPDATE accounts
+SET balance=balance-$1
+WHERE id=$2 AND balance >= $1
+RETURNING balance`, req.Amount, accountID).Scan(&balance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var available int64
+		lookupErr := tx.QueryRow(r.Context(), "SELECT balance FROM accounts WHERE id=$1", accountID).Scan(&available)
+		if errors.Is(lookupErr, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "account not found")
+			return
+		}
+		if lookupErr != nil {
+			writeError(w, http.StatusInternalServerError, "could not check account balance")
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "insufficient funds", "accountId": accountID,
+			"requestedAmount": req.Amount, "availableBalance": available,
+		})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not withdraw funds")
+		return
+	}
+
+	_, err = tx.Exec(r.Context(), `INSERT INTO transactions
+(id, account_id, transaction_type, amount, balance_after, correlation_id)
+VALUES($1, $2, 'WITHDRAWAL', $3, $4, $5)`, uuid.New(), accountID, req.Amount, balance, corrID)
+	event := newEvent("AccountDebited", corrID, accountID, req.Amount, balance, traceIDFromContext(r.Context()))
+	if err == nil {
+		err = queueEvent(r.Context(), tx, event)
+	}
+	if err != nil {
+		if handled := a.writeExistingWithdrawal(w, r, accountID, corrID); handled {
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "could not withdraw funds")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not commit withdrawal")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accountId": accountID, "amount": req.Amount, "balance": balance,
+		"correlationId": corrID, "eventId": event.EventID, "eventQueued": true,
+	})
+}
+
+func (a *app) writeExistingWithdrawal(w http.ResponseWriter, r *http.Request, accountID, corrID uuid.UUID) bool {
+	var existingAccountID uuid.UUID
+	var transactionType string
+	var amount, balance int64
+	err := a.db.QueryRow(r.Context(), `SELECT account_id, transaction_type, amount, balance_after
+FROM transactions WHERE correlation_id=$1`, corrID).Scan(&existingAccountID, &transactionType, &amount, &balance)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	if existingAccountID != accountID || transactionType != "WITHDRAWAL" {
+		writeError(w, http.StatusConflict, "correlationId has already been used for another operation")
+		return true
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accountId": accountID, "amount": amount, "balance": balance,
+		"correlationId": corrID, "duplicate": true,
+	})
+	return true
 }
 
 func seedCategoryCache(ctx context.Context, client *redis.Client) error {

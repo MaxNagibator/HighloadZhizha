@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
 
 func TestRetryDelaySeconds(t *testing.T) {
 	tests := []struct {
@@ -44,6 +49,49 @@ func TestCalculateCashback(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := calculateCashback(tt.amount, policy, personal, tt.monthlyEarned); got != tt.want {
 				t.Fatalf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWithdrawValidatesRequestBeforeDatabaseAccess(t *testing.T) {
+	a := &app{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /accounts/{accountId}/withdrawals", a.withdraw)
+
+	tests := []struct {
+		name   string
+		path   string
+		body   string
+		status int
+	}{
+		{
+			name:   "invalid account id",
+			path:   "/accounts/not-a-uuid/withdrawals",
+			body:   `{"amount":100,"correlationId":"5f85dd65-9550-4dbd-ad0d-f22fa9879830"}`,
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "non-positive amount",
+			path:   "/accounts/37dbac1e-b5ca-44a6-bd68-78f27d152adc/withdrawals",
+			body:   `{"amount":0,"correlationId":"5f85dd65-9550-4dbd-ad0d-f22fa9879830"}`,
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "invalid correlation id",
+			path:   "/accounts/37dbac1e-b5ca-44a6-bd68-78f27d152adc/withdrawals",
+			body:   `{"amount":100,"correlationId":"wrong"}`,
+			status: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, request)
+			if response.Code != tt.status {
+				t.Fatalf("got status %d, want %d; body: %s", response.Code, tt.status, response.Body.String())
 			}
 		})
 	}
