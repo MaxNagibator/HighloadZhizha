@@ -11,6 +11,33 @@ builder.Services.AddHttpClient("bank", client =>
 builder.Services.AddSingleton<LoadManager>();
 
 var app = builder.Build();
+app.Use(async (context, next) =>
+{
+    var traceId = context.Request.Headers["X-Trace-ID"].FirstOrDefault();
+    if (string.IsNullOrWhiteSpace(traceId) || traceId.Length > 128)
+        traceId = Guid.NewGuid().ToString("N");
+
+    context.Response.Headers["X-Trace-ID"] = traceId;
+    var log = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("HttpRequestTracing");
+    using var scope = log.BeginScope(new Dictionary<string, object> { ["traceId"] = traceId });
+    var started = Stopwatch.StartNew();
+    log.LogInformation("HTTP_REQUEST_STARTED method={Method} path={Path}", context.Request.Method, context.Request.Path);
+    try
+    {
+        await next(context);
+    }
+    catch (Exception exception)
+    {
+        log.LogError(exception, "HTTP_REQUEST_FAILED method={Method} path={Path} durationMs={DurationMs}",
+            context.Request.Method, context.Request.Path, started.ElapsedMilliseconds);
+        throw;
+    }
+    finally
+    {
+        log.LogInformation("HTTP_REQUEST_COMPLETED method={Method} path={Path} status={Status} durationMs={DurationMs}",
+            context.Request.Method, context.Request.Path, context.Response.StatusCode, started.ElapsedMilliseconds);
+    }
+});
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 app.MapGet("/api/status", (LoadManager manager) => manager.Status());
 app.MapPost("/api/start", (LoadSettings settings, LoadManager manager) =>
@@ -144,6 +171,7 @@ public sealed class LoadManager(IHttpClientFactory clients, ILogger<LoadManager>
     {
         var create = _accounts.IsEmpty || Random.Shared.Next(100) < settings.CreateAccountPercent;
         var correlationId = Guid.NewGuid();
+        var traceId = Guid.NewGuid().ToString("N");
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(settings.TimeoutSeconds));
         var stopwatch = Stopwatch.StartNew();
@@ -157,7 +185,8 @@ public sealed class LoadManager(IHttpClientFactory clients, ILogger<LoadManager>
             if (create)
             {
                 operation = "create-account";
-                response = await client.PostAsJsonAsync("/accounts", new { ownerName = $"Load test worker {workerId}", correlationId }, timeout.Token);
+                using var request = CreateRequest("/accounts", new { ownerName = $"Load test worker {workerId}", correlationId }, traceId);
+                response = await client.SendAsync(request, timeout.Token);
                 var body = await response.Content.ReadAsStringAsync(timeout.Token);
                 response.EnsureSuccessStatusCode();
                 using var json = JsonDocument.Parse(body);
@@ -170,21 +199,34 @@ public sealed class LoadManager(IHttpClientFactory clients, ILogger<LoadManager>
                 operation = "top-up";
                 if (!_accounts.TryPeek(out var accountId)) return;
                 var amount = Random.Shared.Next(settings.MinTopUp, settings.MaxTopUp + 1);
-                response = await client.PostAsJsonAsync($"/accounts/{accountId}/top-ups", new { amount, correlationId }, timeout.Token);
+                var categories = new[] { "groceries", "transport", "entertainment", "other" };
+                var category = categories[Random.Shared.Next(categories.Length)];
+                using var request = CreateRequest($"/accounts/{accountId}/top-ups", new { amount, correlationId, category }, traceId);
+                response = await client.SendAsync(request, timeout.Token);
                 response.EnsureSuccessStatusCode();
                 Interlocked.Increment(ref _topUps);
             }
             Interlocked.Increment(ref _successes);
-            logger.LogInformation("LOAD_REQUEST operation={Operation} status=success durationMs={DurationMs} correlationId={CorrelationId}",
-                operation, stopwatch.ElapsedMilliseconds, correlationId);
+            logger.LogInformation("LOAD_REQUEST operation={Operation} status=success durationMs={DurationMs} correlationId={CorrelationId} traceId={TraceId}",
+                operation, stopwatch.ElapsedMilliseconds, correlationId, traceId);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception exception)
         {
             Interlocked.Increment(ref _failures);
             _lastError = exception.Message;
-            logger.LogWarning(exception, "LOAD_REQUEST status=failed durationMs={DurationMs} correlationId={CorrelationId}", stopwatch.ElapsedMilliseconds, correlationId);
+            logger.LogWarning(exception, "LOAD_REQUEST status=failed durationMs={DurationMs} correlationId={CorrelationId} traceId={TraceId}", stopwatch.ElapsedMilliseconds, correlationId, traceId);
         }
+    }
+
+    private static HttpRequestMessage CreateRequest<T>(string path, T body, string traceId)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = JsonContent.Create(body)
+        };
+        request.Headers.Add("X-Trace-ID", traceId);
+        return request;
     }
 }
 
