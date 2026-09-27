@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRetryDelaySeconds(t *testing.T) {
@@ -94,5 +95,18 @@ func TestWithdrawValidatesRequestBeforeDatabaseAccess(t *testing.T) {
 				t.Fatalf("got status %d, want %d; body: %s", response.Code, tt.status, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestWithdrawalRetryDelayUsesExponentialBackoffWithJitter(t *testing.T) {
+	for attempt := 0; attempt < maxWithdrawalAttempts-1; attempt++ {
+		minimum := 5 * time.Millisecond * time.Duration(1<<attempt)
+		maximum := minimum + 9*time.Millisecond
+		for range 20 {
+			delay := withdrawalRetryDelay(attempt)
+			if delay < minimum || delay > maximum {
+				t.Fatalf("attempt %d: delay %s outside [%s, %s]", attempt, delay, minimum, maximum)
+			}
+		}
 	}
 }

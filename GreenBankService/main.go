@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -405,15 +406,12 @@ func (a *app) withdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := a.db.Begin(r.Context())
+	balance, event, result, err := a.withdrawWithRetry(
+		r.Context(), accountID, corrID, req.Amount, traceIDFromContext(r.Context()))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
-		return
-	}
-	defer tx.Rollback(r.Context())
-
-	balance, result, err := withdrawOptimistically(r.Context(), tx, accountID, req.Amount)
-	if err != nil {
+		if handled := a.writeExistingWithdrawal(w, r, accountID, corrID); handled {
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "could not withdraw funds")
 		return
 	}
@@ -432,25 +430,6 @@ func (a *app) withdraw(w http.ResponseWriter, r *http.Request) {
 			"error":     "account balance changed concurrently; retry the request",
 			"accountId": accountID, "correlationId": corrID,
 		})
-		return
-	}
-
-	_, err = tx.Exec(r.Context(), `INSERT INTO transactions
-(id, account_id, transaction_type, amount, balance_after, correlation_id)
-VALUES($1, $2, 'WITHDRAWAL', $3, $4, $5)`, uuid.New(), accountID, req.Amount, balance, corrID)
-	event := newEvent("AccountDebited", corrID, accountID, req.Amount, balance, traceIDFromContext(r.Context()))
-	if err == nil {
-		err = queueEvent(r.Context(), tx, event)
-	}
-	if err != nil {
-		if handled := a.writeExistingWithdrawal(w, r, accountID, corrID); handled {
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "could not withdraw funds")
-		return
-	}
-	if err = tx.Commit(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not commit withdrawal")
 		return
 	}
 
@@ -483,18 +462,31 @@ FROM transactions WHERE correlation_id=$1`, corrID).Scan(&existingAccountID, &tr
 	return true
 }
 
-func withdrawOptimistically(ctx context.Context, tx pgx.Tx, accountID uuid.UUID, amount int64) (int64, withdrawalResult, error) {
+func (a *app) withdrawWithRetry(
+	ctx context.Context,
+	accountID, correlationID uuid.UUID,
+	amount int64,
+	traceID string,
+) (int64, bankEvent, withdrawalResult, error) {
 	for attempt := 0; attempt < maxWithdrawalAttempts; attempt++ {
+		tx, err := a.db.Begin(ctx)
+		if err != nil {
+			return 0, bankEvent{}, withdrawalConcurrentConflict, err
+		}
+
 		var balance, version int64
-		err := tx.QueryRow(ctx, "SELECT balance, version FROM accounts WHERE id=$1", accountID).Scan(&balance, &version)
+		err = tx.QueryRow(ctx, "SELECT balance, version FROM accounts WHERE id=$1", accountID).Scan(&balance, &version)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, withdrawalAccountNotFound, nil
+			_ = tx.Rollback(ctx)
+			return 0, bankEvent{}, withdrawalAccountNotFound, nil
 		}
 		if err != nil {
-			return 0, withdrawalConcurrentConflict, err
+			_ = tx.Rollback(ctx)
+			return 0, bankEvent{}, withdrawalConcurrentConflict, err
 		}
 		if balance < amount {
-			return balance, withdrawalInsufficientFunds, nil
+			_ = tx.Rollback(ctx)
+			return balance, bankEvent{}, withdrawalInsufficientFunds, nil
 		}
 
 		newBalance := balance - amount
@@ -502,13 +494,53 @@ func withdrawOptimistically(ctx context.Context, tx pgx.Tx, accountID uuid.UUID,
 SET balance=$1, version=version+1
 WHERE id=$2 AND version=$3`, newBalance, accountID, version)
 		if err != nil {
-			return 0, withdrawalConcurrentConflict, err
+			_ = tx.Rollback(ctx)
+			return 0, bankEvent{}, withdrawalConcurrentConflict, err
 		}
 		if command.RowsAffected() == 1 {
-			return newBalance, withdrawalApplied, nil
+			_, err = tx.Exec(ctx, `INSERT INTO transactions
+(id, account_id, transaction_type, amount, balance_after, correlation_id)
+VALUES($1, $2, 'WITHDRAWAL', $3, $4, $5)`, uuid.New(), accountID, amount, newBalance, correlationID)
+			event := newEvent("AccountDebited", correlationID, accountID, amount, newBalance, traceID)
+			if err == nil {
+				err = queueEvent(ctx, tx, event)
+			}
+			if err == nil {
+				err = tx.Commit(ctx)
+			} else {
+				_ = tx.Rollback(ctx)
+			}
+			if err != nil {
+				return 0, bankEvent{}, withdrawalConcurrentConflict, err
+			}
+			return newBalance, event, withdrawalApplied, nil
+		}
+
+		_ = tx.Rollback(ctx)
+		if attempt == maxWithdrawalAttempts-1 {
+			break
+		}
+		if err = waitForWithdrawalRetry(ctx, attempt); err != nil {
+			return 0, bankEvent{}, withdrawalConcurrentConflict, err
 		}
 	}
-	return 0, withdrawalConcurrentConflict, nil
+	return 0, bankEvent{}, withdrawalConcurrentConflict, nil
+}
+
+func waitForWithdrawalRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(withdrawalRetryDelay(attempt))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func withdrawalRetryDelay(attempt int) time.Duration {
+	base := 5 * time.Millisecond * time.Duration(1<<attempt)
+	return base + time.Duration(rand.IntN(10))*time.Millisecond
 }
 
 func seedCategoryCache(ctx context.Context, client *redis.Client) error {
