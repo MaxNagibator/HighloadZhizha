@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,11 +17,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
 
 type app struct {
 	db     *pgxpool.Pool
+	redis  *redis.Client
 	writer *kafka.Writer
 	topic  string
 	log    *slog.Logger
@@ -33,6 +37,9 @@ type bankEvent struct {
 	AccountID     string    `json:"accountId"`
 	Amount        int64     `json:"amount"`
 	Balance       int64     `json:"balance"`
+	TraceID       string    `json:"traceId"`
+	Category      string    `json:"category,omitempty"`
+	SourceAmount  int64     `json:"sourceAmount,omitempty"`
 }
 
 type createAccountRequest struct {
@@ -43,6 +50,26 @@ type createAccountRequest struct {
 type topUpRequest struct {
 	Amount        int64  `json:"amount"`
 	CorrelationID string `json:"correlationId"`
+	Category      string `json:"category"`
+}
+
+type categoryPolicy struct {
+	Code                string `json:"code"`
+	CashbackBasisPoints int64  `json:"cashbackBasisPoints"`
+	MinimumAmount       int64  `json:"minimumAmount"`
+	MaximumPerOperation int64  `json:"maximumPerOperation"`
+}
+
+type personalCashback struct {
+	ExtraBasisPoints int64
+	MonthlyLimit     int64
+}
+
+var defaultCategoryPolicies = []categoryPolicy{
+	{Code: "groceries", CashbackBasisPoints: 300, MinimumAmount: 500, MaximumPerOperation: 5_000},
+	{Code: "transport", CashbackBasisPoints: 500, MinimumAmount: 100, MaximumPerOperation: 3_000},
+	{Code: "entertainment", CashbackBasisPoints: 700, MinimumAmount: 1_000, MaximumPerOperation: 10_000},
+	{Code: "other", CashbackBasisPoints: 100, MinimumAmount: 100, MaximumPerOperation: 1_000},
 }
 
 func main() {
@@ -61,12 +88,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	redisClient := redis.NewClient(&redis.Options{Addr: env("REDIS_ADDR", "localhost:6379")})
+	defer redisClient.Close()
+	if err = redisClient.Ping(ctx).Err(); err != nil {
+		logger.Error("redis connection failed", "error", err)
+		os.Exit(1)
+	}
+	if err = seedCategoryCache(ctx, redisClient); err != nil {
+		logger.Error("cashback category cache initialization failed", "error", err)
+		os.Exit(1)
+	}
+
 	brokers := strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ",")
 	topic := env("KAFKA_TOPIC", "bank.account.events")
 	writer := &kafka.Writer{Addr: kafka.TCP(brokers...), Topic: topic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
 	defer writer.Close()
 
-	a := &app{db: db, writer: writer, topic: topic, log: logger}
+	a := &app{db: db, redis: redisClient, writer: writer, topic: topic, log: logger}
 	go a.runOutboxPublisher(ctx)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.health)
@@ -74,6 +112,7 @@ func main() {
 	mux.HandleFunc("POST /accounts/{accountId}/top-ups", a.topUp)
 
 	server := &http.Server{Addr: ":8080", Handler: requestLog(logger, mux), ReadHeaderTimeout: 5 * time.Second}
+	profileServer := &http.Server{Addr: ":6060", Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		logger.Info("GreenBankService started", "address", server.Addr, "topic", topic)
 		if serveErr := server.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
@@ -81,14 +120,23 @@ func main() {
 			stop()
 		}
 	}()
+	go func() {
+		logger.Info("GreenBankService profiler started", "address", profileServer.Addr)
+		if serveErr := profileServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			logger.Error("profiler server failed", "error", serveErr)
+			stop()
+		}
+	}()
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+	_ = profileServer.Shutdown(shutdownCtx)
 }
 
 func migrate(ctx context.Context, db *pgxpool.Pool) error {
 	_, err := db.Exec(ctx, `
+SELECT pg_advisory_xact_lock(hashtext('green-bank-schema-migration'));
 CREATE TABLE IF NOT EXISTS accounts (
     id uuid PRIMARY KEY,
     owner_name text NOT NULL,
@@ -98,13 +146,29 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS transactions (
     id uuid PRIMARY KEY,
     account_id uuid NOT NULL REFERENCES accounts(id),
-    transaction_type text NOT NULL CHECK (transaction_type IN ('TOP_UP')),
+    transaction_type text NOT NULL,
     amount bigint NOT NULL CHECK (amount > 0),
     balance_after bigint NOT NULL CHECK (balance_after >= 0),
     correlation_id uuid NOT NULL UNIQUE,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_transaction_type_check;
+ALTER TABLE transactions ADD CONSTRAINT transactions_transaction_type_check CHECK (transaction_type IN ('TOP_UP', 'CASHBACK'));
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS category text;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_transaction_id uuid REFERENCES transactions(id);
 CREATE INDEX IF NOT EXISTS ix_transactions_account_created ON transactions(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_transactions_cashback_month
+    ON transactions(account_id, created_at)
+    WHERE transaction_type = 'CASHBACK';
+CREATE TABLE IF NOT EXISTS account_cashback_settings (
+    account_id uuid PRIMARY KEY REFERENCES accounts(id),
+    extra_basis_points integer NOT NULL DEFAULT 0 CHECK (extra_basis_points BETWEEN 0 AND 3000),
+    monthly_limit bigint NOT NULL DEFAULT 50000 CHECK (monthly_limit >= 0),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO account_cashback_settings(account_id)
+SELECT id FROM accounts
+ON CONFLICT (account_id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS account_requests (
     correlation_id uuid PRIMARY KEY,
     account_id uuid NOT NULL UNIQUE REFERENCES accounts(id),
@@ -134,6 +198,10 @@ func (a *app) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "database unavailable")
 		return
 	}
+	if err := a.redis.Ping(r.Context()).Err(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "redis unavailable")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "outboxPending": pending})
 }
 
@@ -149,7 +217,7 @@ func (a *app) createAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accountID := uuid.New()
-	event := newEvent("AccountCreated", corrID, accountID, 0, 0)
+	event := newEvent("AccountCreated", corrID, accountID, 0, 0, traceIDFromContext(r.Context()))
 	tx, err := a.db.Begin(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
@@ -157,6 +225,9 @@ func (a *app) createAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	_, err = tx.Exec(r.Context(), "INSERT INTO accounts(id, owner_name) VALUES($1, $2)", accountID, strings.TrimSpace(req.OwnerName))
+	if err == nil {
+		_, err = tx.Exec(r.Context(), "INSERT INTO account_cashback_settings(account_id) VALUES($1)", accountID)
+	}
 	if err == nil {
 		_, err = tx.Exec(r.Context(), "INSERT INTO account_requests(correlation_id, account_id) VALUES($1, $2)", corrID, accountID)
 	}
@@ -192,9 +263,23 @@ func (a *app) topUp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "amount must be a positive integer in minor currency units")
 		return
 	}
+	req.Category = strings.ToLower(strings.TrimSpace(req.Category))
+	if req.Category == "" {
+		writeError(w, http.StatusBadRequest, "category is required")
+		return
+	}
 	corrID, err := uuid.Parse(req.CorrelationID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "correlationId is required and must be a UUID")
+		return
+	}
+	policy, err := a.loadCategoryPolicy(r.Context(), req.Category)
+	if errors.Is(err, redis.Nil) {
+		writeError(w, http.StatusBadRequest, "unknown category")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "cashback category cache unavailable")
 		return
 	}
 
@@ -204,6 +289,26 @@ func (a *app) topUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+
+	// Intentionally read for every top-up. This is a profiling hotspot and a future cache candidate.
+	personal, err := loadPersonalCashback(r.Context(), tx, accountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load personal cashback settings")
+		return
+	}
+	monthlyCashback, err := loadCurrentMonthCashback(r.Context(), tx, accountID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not calculate monthly cashback")
+		return
+	}
+	cashback := calculateCashback(req.Amount, policy, personal, monthlyCashback)
+	topUpTransactionID := uuid.New()
+	cashbackCorrelationID := uuid.NewSHA1(corrID, []byte("cashback"))
+
 	var balance int64
 	err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1 WHERE id=$2 RETURNING balance", req.Amount, accountID).Scan(&balance)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -211,13 +316,28 @@ func (a *app) topUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err == nil {
-		_, err = tx.Exec(r.Context(), `INSERT INTO transactions(id, account_id, transaction_type, amount, balance_after, correlation_id)
-VALUES($1, $2, 'TOP_UP', $3, $4, $5)`, uuid.New(), accountID, req.Amount, balance, corrID)
+		_, err = tx.Exec(r.Context(), `INSERT INTO transactions(id, account_id, transaction_type, amount, balance_after, correlation_id, category)
+VALUES($1, $2, 'TOP_UP', $3, $4, $5, $6)`, topUpTransactionID, accountID, req.Amount, balance, corrID, policy.Code)
 	}
-	var event bankEvent
+	var topUpEvent bankEvent
 	if err == nil {
-		event = newEvent("AccountToppedUp", corrID, accountID, req.Amount, balance)
-		err = queueEvent(r.Context(), tx, event)
+		topUpEvent = newEvent("AccountToppedUp", corrID, accountID, req.Amount, balance, traceIDFromContext(r.Context()))
+		topUpEvent.Category = policy.Code
+		err = queueEvent(r.Context(), tx, topUpEvent)
+	}
+	var cashbackEvent bankEvent
+	if err == nil && cashback > 0 {
+		err = tx.QueryRow(r.Context(), "UPDATE accounts SET balance=balance+$1 WHERE id=$2 RETURNING balance", cashback, accountID).Scan(&balance)
+	}
+	if err == nil && cashback > 0 {
+		_, err = tx.Exec(r.Context(), `INSERT INTO transactions(id, account_id, transaction_type, amount, balance_after, correlation_id, category, source_transaction_id)
+VALUES($1, $2, 'CASHBACK', $3, $4, $5, $6, $7)`, uuid.New(), accountID, cashback, balance, cashbackCorrelationID, policy.Code, topUpTransactionID)
+	}
+	if err == nil && cashback > 0 {
+		cashbackEvent = newEvent("CashbackGranted", cashbackCorrelationID, accountID, cashback, balance, traceIDFromContext(r.Context()))
+		cashbackEvent.Category = policy.Code
+		cashbackEvent.SourceAmount = req.Amount
+		err = queueEvent(r.Context(), tx, cashbackEvent)
 	}
 	if err != nil {
 		var existingAmount, existingBalance int64
@@ -234,11 +354,82 @@ VALUES($1, $2, 'TOP_UP', $3, $4, $5)`, uuid.New(), accountID, req.Amount, balanc
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"accountId": accountID, "amount": req.Amount, "balance": balance, "correlationId": corrID, "eventId": event.EventID, "eventQueued": true})
+	response := map[string]any{
+		"accountId": accountID, "amount": req.Amount, "category": policy.Code,
+		"cashback": cashback, "balance": balance, "correlationId": corrID,
+		"eventId": topUpEvent.EventID, "eventQueued": true,
+	}
+	if cashback > 0 {
+		response["cashbackEventId"] = cashbackEvent.EventID
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
-func newEvent(eventType string, correlationID, accountID uuid.UUID, amount, balance int64) bankEvent {
-	return bankEvent{EventID: uuid.NewString(), EventType: eventType, OccurredAt: time.Now().UTC(), CorrelationID: correlationID.String(), AccountID: accountID.String(), Amount: amount, Balance: balance}
+func seedCategoryCache(ctx context.Context, client *redis.Client) error {
+	for _, policy := range defaultCategoryPolicies {
+		payload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		if err = client.SetNX(ctx, categoryCacheKey(policy.Code), payload, 0).Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *app) loadCategoryPolicy(ctx context.Context, category string) (categoryPolicy, error) {
+	payload, err := a.redis.Get(ctx, categoryCacheKey(category)).Bytes()
+	if err != nil {
+		return categoryPolicy{}, err
+	}
+	var policy categoryPolicy
+	if err = json.Unmarshal(payload, &policy); err != nil {
+		return categoryPolicy{}, fmt.Errorf("decode category %q: %w", category, err)
+	}
+	return policy, nil
+}
+
+func categoryCacheKey(category string) string {
+	return "green-bank:cashback-category:" + category
+}
+
+func loadPersonalCashback(ctx context.Context, tx pgx.Tx, accountID uuid.UUID) (personalCashback, error) {
+	var setting personalCashback
+	err := tx.QueryRow(ctx, `SELECT extra_basis_points, monthly_limit
+FROM account_cashback_settings WHERE account_id=$1`, accountID).Scan(&setting.ExtraBasisPoints, &setting.MonthlyLimit)
+	return setting, err
+}
+
+func loadCurrentMonthCashback(ctx context.Context, tx pgx.Tx, accountID uuid.UUID) (int64, error) {
+	var amount int64
+	err := tx.QueryRow(ctx, `SELECT COALESCE(sum(amount), 0)
+FROM transactions
+WHERE account_id=$1 AND transaction_type='CASHBACK'
+  AND created_at >= date_trunc('month', now())`, accountID).Scan(&amount)
+	return amount, err
+}
+
+func calculateCashback(amount int64, policy categoryPolicy, personal personalCashback, monthlyCashback int64) int64 {
+	if amount < policy.MinimumAmount || personal.MonthlyLimit <= monthlyCashback {
+		return 0
+	}
+	cashback := amount * (policy.CashbackBasisPoints + personal.ExtraBasisPoints) / 10_000
+	if cashback > policy.MaximumPerOperation {
+		cashback = policy.MaximumPerOperation
+	}
+	remainingMonthlyLimit := personal.MonthlyLimit - monthlyCashback
+	if cashback > remainingMonthlyLimit {
+		cashback = remainingMonthlyLimit
+	}
+	if cashback < 0 {
+		return 0
+	}
+	return cashback
+}
+
+func newEvent(eventType string, correlationID, accountID uuid.UUID, amount, balance int64, traceID string) bankEvent {
+	return bankEvent{EventID: uuid.NewString(), EventType: eventType, OccurredAt: time.Now().UTC(), CorrelationID: correlationID.String(), AccountID: accountID.String(), Amount: amount, Balance: balance, TraceID: traceID}
 }
 
 func queueEvent(ctx context.Context, tx pgx.Tx, event bankEvent) error {
@@ -353,10 +544,61 @@ func parseOrNewUUID(value string) (uuid.UUID, error) {
 
 func requestLog(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := strings.TrimSpace(r.Header.Get("X-Trace-ID"))
+		if traceID == "" || len(traceID) > 128 {
+			traceID = uuid.NewString()
+		}
+		ctx := context.WithValue(r.Context(), traceIDContextKey{}, traceID)
+		r = r.WithContext(ctx)
+		w.Header().Set("X-Trace-ID", traceID)
+		recorder := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		started := time.Now()
-		next.ServeHTTP(w, r)
-		logger.Info("http request", "method", r.Method, "path", r.URL.Path, "durationMs", time.Since(started).Milliseconds())
+		logger.Info("HTTP_REQUEST_STARTED", "traceId", traceID, "method", r.Method, "path", r.URL.Path)
+		defer func() {
+			duration := time.Since(started)
+			if recovered := recover(); recovered != nil {
+				logger.Error("HTTP_REQUEST_PANIC", "traceId", traceID, "method", r.Method, "path", r.URL.Path, "durationMs", duration.Milliseconds(), "panic", recovered)
+				if !recorder.wroteHeader {
+					http.Error(recorder, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				}
+				return
+			}
+			logger.Info("HTTP_REQUEST_COMPLETED", "traceId", traceID, "method", r.Method, "path", r.URL.Path, "status", recorder.status, "durationMs", duration.Milliseconds(), "bytes", recorder.bytes)
+		}()
+		next.ServeHTTP(recorder, r)
 	})
+}
+
+type traceIDContextKey struct{}
+
+func traceIDFromContext(ctx context.Context) string {
+	traceID, _ := ctx.Value(traceIDContextKey{}).(string)
+	return traceID
+}
+
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	bytes       int
+	wroteHeader bool
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += n
+	return n, err
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

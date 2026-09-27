@@ -24,4 +24,4 @@ metadata:
 data:
   KAFKA_BROKERS: kafka:9092
   KAFKA_TOPIC: bank.account.events
-
+  REDIS_ADDR: redis:6379
