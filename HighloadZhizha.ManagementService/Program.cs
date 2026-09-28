@@ -153,17 +153,34 @@ public sealed class LoadManager(IHttpClientFactory clients, ILogger<LoadManager>
     private async Task RunWorkerAsync(int workerId, LoadSettings settings, CancellationToken cancellationToken)
     {
         var interval = TimeSpan.FromSeconds(1d / settings.RequestsPerSecondPerWorker);
-        using var timer = new PeriodicTimer(interval);
-        while (!cancellationToken.IsCancellationRequested)
+        const int maxInFlightPerWorker = 100;
+        var inFlight = new HashSet<Task>();
+        var intervalTicks = Math.Max(1L, (long)(interval.TotalSeconds * Stopwatch.Frequency));
+        var nextTick = Stopwatch.GetTimestamp();
+
+        try
         {
-            var started = Stopwatch.GetTimestamp();
-            await SendRequestAsync(workerId, settings, cancellationToken);
-            var elapsed = Stopwatch.GetElapsedTime(started);
-            var remainder = interval - elapsed;
-            if (remainder > TimeSpan.Zero)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                try { await Task.Delay(remainder, cancellationToken); } catch (OperationCanceledException) { break; }
+                nextTick += intervalTicks;
+                var delayTicks = nextTick - Stopwatch.GetTimestamp();
+                if (delayTicks > 0)
+                    await Task.Delay(TimeSpan.FromSeconds((double)delayTicks / Stopwatch.Frequency), cancellationToken);
+
+                inFlight.RemoveWhere(static task => task.IsCompleted);
+                if (inFlight.Count >= maxInFlightPerWorker)
+                {
+                    nextTick = Stopwatch.GetTimestamp();
+                    continue;
+                }
+
+                inFlight.Add(SendRequestAsync(workerId, settings, cancellationToken));
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        finally
+        {
+            await Task.WhenAll(inFlight);
         }
     }
 
@@ -197,7 +214,8 @@ public sealed class LoadManager(IHttpClientFactory clients, ILogger<LoadManager>
             else
             {
                 operation = "top-up";
-                if (!_accounts.TryPeek(out var accountId)) return;
+                if (!_accounts.TryDequeue(out var accountId)) return;
+                _accounts.Enqueue(accountId);
                 var amount = Random.Shared.Next(settings.MinTopUp, settings.MaxTopUp + 1);
                 var categories = new[] { "groceries", "transport", "entertainment", "other" };
                 var category = categories[Random.Shared.Next(categories.Length)];

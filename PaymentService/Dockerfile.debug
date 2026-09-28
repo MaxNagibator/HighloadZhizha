@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0
+
+RUN dotnet tool install --tool-path /tools dotnet-trace \
+ && dotnet tool install --tool-path /tools dotnet-counters \
+ && dotnet tool install --tool-path /tools dotnet-dump
+
+ENV PATH="${PATH}:/tools"
+
+ENTRYPOINT ["sleep", "infinity"]
